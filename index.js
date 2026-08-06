@@ -6,13 +6,26 @@ const path = require('path');
 const crypto = require('crypto');
 const axios = require('axios');
 
-const BACKEND_URL = process.env.SIGNAL_BACKEND_URL || 'http://127.0.0.1:3400';
+const BACKEND_URL = process.env.SIGNAL_BACKEND_URL || 'https://provider.hipobot.xyz';
 const POLL_MS = parseInt(process.env.CLIENT_POLL_MS, 10) || 15000;
 const HEARTBEAT_MS = parseInt(process.env.CLIENT_HEARTBEAT_MS, 10) || 10000;
 const ORDER_SIZE = parseInt(process.env.KUCOIN_ORDER_SIZE, 10) || 1;
+// KuCoin Futures requires a `leverage` on position-opening orders; omitting it (or
+// sending an invalid value) is rejected with {"code":"100001","msg":"Leverage
+// parameter invalid."}. Match the strategy's configured leverage (config LEVERAGE=20).
+// Not sent on reduceOnly (closing) orders — those close existing size and take no leverage.
+const KUCOIN_LEVERAGE = parseFloat(process.env.KUCOIN_LEVERAGE) || 20;
 const CLOSE_RETRY_MAX = parseInt(process.env.KUCOIN_CLOSE_RETRY_MAX, 10) || 3;
 const ORDER_STATUS_TIMEOUT_MS = parseInt(process.env.KUCOIN_ORDER_STATUS_TIMEOUT_MS, 10) || 20000;
 const ORDER_STATUS_POLL_MS = parseInt(process.env.KUCOIN_ORDER_STATUS_POLL_MS, 10) || 1500;
+// Futures wallet currency for the account-overview balance report (USDT-margined).
+const ACCOUNT_CURRENCY = process.env.KUCOIN_ACCOUNT_CURRENCY || 'USDT';
+// Optional hard cap on contracts per order (0 = uncapped). A safety rail on top of risk sizing.
+const MAX_ORDER_SIZE = parseInt(process.env.KUCOIN_MAX_ORDER_SIZE, 10) || 0;
+// Client-chosen trading capital. When set (>0) this — not the full account equity —
+// is the base the backend's risk% is applied to, so a client can allocate only part
+// of their account to the bot. Capped at actual equity so it can never over-allocate.
+const TRADING_CAPITAL = parseFloat(process.env.TRADING_CAPITAL) || 0;
 
 // ─── Licensing / verification ───
 // The bot authenticates to signal-backend with a per-client API key issued from
@@ -58,6 +71,12 @@ let sessionActive = false;   // holds the backend session lock
 let authorized = false;      // admin-approved
 let paused = false;          // desiredState from backend (running/paused) OR not authorized
 let licenseFatal = false;    // unrecoverable (bad key / IP blocked / double bot) → stop
+
+// Sizing runtime state. The backend owns the risk policy and pushes the effective
+// risk% (per-bot override, else its global default) in the session/heartbeat
+// response — the bot never computes the strategy, only sizes to this one number.
+let riskPerTradePct = null;  // effective risk% from backend; null → fall back to fixed ORDER_SIZE
+let accountBalance = null;   // { equity, available, currency } last read from KuCoin (reported to backend)
 
 function requireCredentials() {
   if (!API_KEY || !API_SECRET || !API_PASSPHRASE) {
@@ -145,15 +164,98 @@ async function placeMarketOrder({ coin, side, size, reduceOnly }) {
     size: String(size),
     reduceOnly: !!reduceOnly,
   };
+  // Opening orders must carry a valid leverage or KuCoin rejects them (code 100001).
+  // Closing orders (reduceOnly) reduce existing size and must not send leverage.
+  if (!reduceOnly) payload.leverage = String(KUCOIN_LEVERAGE);
   const data = await kucoinRequest('POST', '/api/v1/orders', payload);
   return data.orderId || data.id;
+}
+
+// ─── Balance + risk-based sizing ───
+// Public (unsigned) KuCoin GET for reference data (contract specs, mark price).
+async function kucoinPublic(endpoint) {
+  const res = await axios.get(`${KUCOIN_BASE}${endpoint}`, { timeout: 15000 });
+  if (!res.data || String(res.data.code) !== '200000') {
+    throw new Error(`KuCoin error: ${JSON.stringify(res.data)}`);
+  }
+  return res.data.data;
+}
+
+const contractMultipliers = {}; // symbol -> lot multiplier (base units per contract), cached
+async function getMultiplier(symbol) {
+  if (contractMultipliers[symbol] != null) return contractMultipliers[symbol];
+  const d = await kucoinPublic(`/api/v1/contracts/${symbol}`);
+  const m = Number(d && d.multiplier);
+  if (Number.isFinite(m) && m > 0) contractMultipliers[symbol] = m;
+  return contractMultipliers[symbol];
+}
+
+async function getMarkPrice(symbol) {
+  const d = await kucoinPublic(`/api/v1/mark-price/${symbol}/current`);
+  const v = Number(d && d.value);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/** Read the futures account balance for ACCOUNT_CURRENCY; keep last value on failure. */
+async function refreshBalance() {
+  const capital = TRADING_CAPITAL > 0 ? TRADING_CAPITAL : null;
+  try {
+    const d = await kucoinRequest('GET', `/api/v1/account-overview?currency=${ACCOUNT_CURRENCY}`);
+    accountBalance = {
+      equity: Number(d.accountEquity),
+      available: Number(d.availableBalance),
+      currency: ACCOUNT_CURRENCY,
+      capital, // client-set trading capital (null = use full equity)
+    };
+  } catch (e) {
+    console.error('[client-bot] balance fetch failed:', e.message);
+    // Still surface the client-set capital even if the exchange read failed.
+    accountBalance = { ...(accountBalance || { currency: ACCOUNT_CURRENCY }), capital };
+  }
+  return accountBalance;
+}
+
+/**
+ * Contracts to trade for `coin`. The bot has no stop-loss, so risk% is applied as
+ * position notional: notional = equity * risk% / 100, converted to lots via the
+ * contract multiplier and current mark price. Falls back to the fixed ORDER_SIZE
+ * whenever an input is missing so behavior degrades safely; returns 0 (skip) only
+ * when risk sizing is fully available but too small for a single lot.
+ */
+async function computeOrderSize(coin) {
+  const symbol = SYMBOLS[coin];
+  const equity = accountBalance && Number(accountBalance.equity);
+  // Sizing base: the client-set trading capital when configured (never above real
+  // equity), otherwise the full account equity.
+  let capitalBase;
+  if (TRADING_CAPITAL > 0) capitalBase = equity > 0 ? Math.min(TRADING_CAPITAL, equity) : TRADING_CAPITAL;
+  else capitalBase = equity;
+  if (!(riskPerTradePct > 0) || !(capitalBase > 0)) return { size: ORDER_SIZE, basis: 'fixed' };
+  try {
+    const [mult, mark] = await Promise.all([getMultiplier(symbol), getMarkPrice(symbol)]);
+    if (!(mult > 0) || !(mark > 0)) return { size: ORDER_SIZE, basis: 'fixed' };
+    const notional = capitalBase * (riskPerTradePct / 100);
+    const contractValue = mark * mult; // quote-currency value of one lot
+    let size = Math.floor(notional / contractValue);
+    if (MAX_ORDER_SIZE > 0) size = Math.min(size, MAX_ORDER_SIZE);
+    if (size < 1) return { size: 0, basis: 'risk-too-small' };
+    return { size, basis: 'risk' };
+  } catch (e) {
+    console.error('[client-bot] size calc failed, using fixed size:', e.message);
+    return { size: ORDER_SIZE, basis: 'fixed' };
+  }
 }
 
 async function openPositionFromSignal(coin, signal) {
   const side = signal.action === 'LONG' ? 'buy' : 'sell';
   const state = botState[coin];
   if (state && state.open) return;
-  const orderId = await placeMarketOrder({ coin, side, size: ORDER_SIZE, reduceOnly: false });
+  const { size, basis } = await computeOrderSize(coin);
+  if (size < 1) {
+    console.log(`[client-bot] OPEN ${coin} skipped — ${basis} (risk=${riskPerTradePct}% equity=${accountBalance && accountBalance.equity})`);
+    return;
+  }
+  const orderId = await placeMarketOrder({ coin, side, size, reduceOnly: false });
   const final = await waitForOrderFinal(orderId);
   if (final.status !== 'filled') {
     await cancelOrder(orderId);
@@ -163,11 +265,11 @@ async function openPositionFromSignal(coin, signal) {
   botState[coin] = {
     open: true,
     side,
-    size: ORDER_SIZE,
+    size,
     openedAt: signal.barTime,
     entryOrderId: orderId,
   };
-  console.log(`[client-bot] OPEN filled ${coin} ${side} size=${ORDER_SIZE}`);
+  console.log(`[client-bot] OPEN filled ${coin} ${side} size=${size} (${basis})`);
 }
 
 async function closePosition(coin, reason) {
@@ -238,17 +340,19 @@ function handleLicenseError(res, ctx) {
 }
 
 async function startSession() {
+  await refreshBalance();
   const res = await axios.post(
     `${BACKEND_URL}/client/session/start`,
-    { instanceId: INSTANCE_ID, positions: openPositionsSummary() },
+    { instanceId: INSTANCE_ID, positions: openPositionsSummary(), balance: accountBalance },
     { headers: licenseHeaders(), timeout: 20000, validateStatus: () => true }
   );
   if (res.status === 200 && res.data && res.data.ok) {
     const c = res.data.client || {};
     authorized = c.authorized !== false;
     paused = c.desiredState === 'paused' || !authorized;
+    if (c.riskPerTradePct != null) riskPerTradePct = Number(c.riskPerTradePct);
     sessionActive = true;
-    console.log(`[client-bot] session claimed | client=${c.name || c.id} authorized=${authorized} state=${paused ? 'paused' : 'running'}`);
+    console.log(`[client-bot] session claimed | client=${c.name || c.id} authorized=${authorized} state=${paused ? 'paused' : 'running'} risk=${riskPerTradePct != null ? riskPerTradePct + '%' : 'fixed'}`);
     return true;
   }
   handleLicenseError(res, 'session start');
@@ -256,15 +360,17 @@ async function startSession() {
 }
 
 async function heartbeat() {
+  await refreshBalance();
   const res = await axios.post(
     `${BACKEND_URL}/client/session/heartbeat`,
-    { instanceId: INSTANCE_ID, status: paused ? 'paused' : 'running', positions: openPositionsSummary() },
+    { instanceId: INSTANCE_ID, status: paused ? 'paused' : 'running', positions: openPositionsSummary(), balance: accountBalance },
     { headers: licenseHeaders(), timeout: 15000, validateStatus: () => true }
   );
   if (res.status === 200 && res.data && res.data.ok) {
     const wasPaused = paused;
     authorized = res.data.authorized !== false;
     paused = res.data.desiredState === 'paused' || !authorized;
+    if (res.data.riskPerTradePct != null) riskPerTradePct = Number(res.data.riskPerTradePct);
     if (wasPaused !== paused) console.log(`[client-bot] state -> ${paused ? 'PAUSED' : 'RUNNING'}`);
     return true;
   }
@@ -355,7 +461,7 @@ async function main() {
   if (!CLIENT_API_KEY) {
     throw new Error('Missing CLIENT_API_KEY. Create a client in the admin panel and copy its API key into .env.');
   }
-  console.log(`[client-bot] started | backend=${BACKEND_URL} | instance=${INSTANCE_ID} | poll=${POLL_MS}ms heartbeat=${HEARTBEAT_MS}ms`);
+  console.log(`[client-bot] started | backend=${BACKEND_URL} | instance=${INSTANCE_ID} | poll=${POLL_MS}ms heartbeat=${HEARTBEAT_MS}ms | capital=${TRADING_CAPITAL > 0 ? TRADING_CAPITAL + ' ' + ACCOUNT_CURRENCY : 'full equity'}`);
 
   await tick();
   if (licenseFatal) return shutdownFatal();
