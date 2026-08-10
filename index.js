@@ -62,6 +62,8 @@ const SYMBOLS = {
   XRP: 'XRPUSDTM',
   DOGE: 'DOGEUSDTM',
 };
+// Reverse lookup (contract symbol → coin) for reporting KuCoin positions.
+const SYMBOL_TO_COIN = Object.fromEntries(Object.entries(SYMBOLS).map(([coin, sym]) => [sym, coin]));
 
 const botState = {};
 const lastProcessedSignal = {};
@@ -133,10 +135,26 @@ function normalizeOrderStatus(data) {
   return { done, unfilled, partial: dealSize > 0 && dealSize < size };
 }
 
+// KuCoin Futures has a brief propagation lag after POST /orders: querying the
+// order by id can transiently return {"code":"100001","msg":"error.getOrder.orderNotExist"}
+// even though the order was accepted. Treat that as "not visible yet" and keep
+// polling instead of throwing (which would abort the whole tick).
+function isOrderNotYetVisible(err) {
+  const m = err && err.message;
+  return typeof m === 'string' && (m.includes('orderNotExist') || m.includes('"100001"'));
+}
+
 async function waitForOrderFinal(orderId) {
   const start = Date.now();
   while (Date.now() - start < ORDER_STATUS_TIMEOUT_MS) {
-    const ord = await kucoinRequest('GET', `/api/v1/orders/${orderId}`);
+    let ord;
+    try {
+      ord = await kucoinRequest('GET', `/api/v1/orders/${orderId}`);
+    } catch (err) {
+      if (!isOrderNotYetVisible(err)) throw err;
+      await sleep(ORDER_STATUS_POLL_MS);
+      continue;
+    }
     const status = normalizeOrderStatus(ord);
     if (status.done) return { status: 'filled', raw: ord };
     if (status.unfilled) return { status: 'unfilled', raw: ord };
@@ -246,6 +264,55 @@ async function computeOrderSize(coin) {
   }
 }
 
+// ─── Real KuCoin position reporting ───
+// The bot reports its ACTUAL exchange positions (not just internal botState) so the
+// user's "My Bot" page and the admin panel show the real amount/entry/mark/PnL/liq —
+// the same numbers the KuCoin UI shows. Falls back to the last-good report, then to
+// the internal botState summary, so a transient fetch failure never blanks the UI.
+let lastPositionReport = [];
+async function fetchPositionReport() {
+  try {
+    const list = await kucoinRequest('GET', '/api/v1/positions');
+    const arr = Array.isArray(list) ? list : [];
+    const out = [];
+    for (const p of arr) {
+      const qty = Number(p.currentQty || 0);
+      if (!qty) continue; // flat — skip
+      const symbol = p.symbol;
+      const coin = SYMBOL_TO_COIN[symbol] || symbol;
+      let mult = 0;
+      try { mult = await getMultiplier(symbol); } catch (_) { /* keep 0 → amount null */ }
+      const contracts = Math.abs(qty);
+      const amount = mult > 0 ? contracts * mult : null; // base-asset quantity (e.g. DOGE)
+      const mark = Number(p.markPrice) || null;
+      const st = botState[coin];
+      out.push({
+        coin,
+        symbol,
+        side: qty > 0 ? 'buy' : 'sell',
+        size: contracts,                                                       // contracts (lots)
+        amount,                                                                // base-asset amount
+        entryPrice: p.avgEntryPrice != null ? Number(p.avgEntryPrice) : null,
+        markPrice: mark,
+        unrealisedPnl: p.unrealisedPnl != null ? Number(p.unrealisedPnl) : null,
+        unrealisedRoePcnt: p.unrealisedRoePcnt != null ? Number(p.unrealisedRoePcnt) : null, // ROI as fraction
+        realisedPnl: p.realisedPnl != null ? Number(p.realisedPnl) : null,
+        liquidationPrice: p.liquidationPrice != null ? Number(p.liquidationPrice) : null,
+        margin: p.posMargin != null ? Number(p.posMargin) : null,
+        leverage: p.realLeverage != null ? Number(p.realLeverage) : null,
+        value: (amount != null && mark != null) ? amount * mark : null,       // notional
+        openedAt: p.openingTimestamp ? Math.floor(Number(p.openingTimestamp) / 1000)
+          : (st && st.openedAt != null ? st.openedAt : null),
+      });
+    }
+    lastPositionReport = out;
+    return out;
+  } catch (e) {
+    if (lastPositionReport.length) return lastPositionReport;
+    return openPositionsSummary();
+  }
+}
+
 async function openPositionFromSignal(coin, signal) {
   const side = signal.action === 'LONG' ? 'buy' : 'sell';
   const state = botState[coin];
@@ -296,6 +363,111 @@ async function closePosition(coin, reason) {
   console.error(`[client-bot] CLOSE FAILED ${coin}: order remained unfilled after ${CLOSE_RETRY_MAX} attempts`);
 }
 
+// ─── Admin remote control ───
+// The backend delivers operator commands (OPEN / CLOSE / CLOSE_ALL) in the
+// heartbeat response, deliver-once (a command is never sent twice), so a crash
+// between receive and execute drops it rather than risking a double trade. We
+// still de-dupe by id and serialize execution as a second guard.
+const handledCommandIds = new Set();
+let commandChain = Promise.resolve();
+
+function normalizeSide(s) {
+  const v = String(s || '').toLowerCase();
+  if (v === 'buy' || v === 'long') return 'buy';
+  if (v === 'sell' || v === 'short') return 'sell';
+  return null;
+}
+
+/** Operator-forced open. Sized by the same risk% as signal entries (or an explicit override). */
+async function adminOpen(coin, side, sizeOverride) {
+  const state = botState[coin];
+  if (state && state.open) {
+    console.log(`[client-bot] ADMIN OPEN ${coin} skipped — already open`);
+    return;
+  }
+  let size, basis;
+  if (sizeOverride != null && Number.isFinite(Number(sizeOverride)) && Number(sizeOverride) > 0) {
+    size = Math.floor(Number(sizeOverride)); basis = 'admin-size';
+  } else {
+    ({ size, basis } = await computeOrderSize(coin));
+  }
+  if (size < 1) { console.log(`[client-bot] ADMIN OPEN ${coin} skipped — ${basis}`); return; }
+  const orderId = await placeMarketOrder({ coin, side, size, reduceOnly: false });
+  const final = await waitForOrderFinal(orderId);
+  if (final.status !== 'filled') {
+    await cancelOrder(orderId);
+    console.log(`[client-bot] ADMIN OPEN ${coin} ${side} not filled (${final.status})`);
+    return;
+  }
+  botState[coin] = { open: true, side, size, openedAt: Math.floor(Date.now() / 1000), entryOrderId: orderId };
+  console.log(`[client-bot] ADMIN OPEN filled ${coin} ${side} size=${size} (${basis})`);
+}
+
+/**
+ * Operator-forced close. Reads the LIVE exchange position (not just botState) so it
+ * closes whatever is actually open — even a position this bot didn't open or has
+ * forgotten after a restart. reduceOnly market close, retried like a normal close.
+ */
+async function closeCoinFromExchange(coin, reason) {
+  const symbol = SYMBOLS[coin];
+  if (!symbol) return;
+  let pos = null;
+  try { pos = await kucoinRequest('GET', `/api/v1/position?symbol=${symbol}`); } catch (_) {}
+  const qty = pos ? Number(pos.currentQty || 0) : 0;
+  if (!qty) {
+    console.log(`[client-bot] ADMIN CLOSE ${coin} — no open position`);
+    botState[coin] = { open: false, lastCloseReason: reason, closedAt: Date.now() };
+    return;
+  }
+  const closeSide = qty > 0 ? 'sell' : 'buy';
+  const size = Math.abs(qty);
+  for (let attempt = 1; attempt <= CLOSE_RETRY_MAX; attempt += 1) {
+    const orderId = await placeMarketOrder({ coin, side: closeSide, size, reduceOnly: true });
+    const final = await waitForOrderFinal(orderId);
+    if (final.status === 'filled') {
+      botState[coin] = { open: false, lastCloseReason: reason, closedAt: Date.now() };
+      console.log(`[client-bot] ADMIN CLOSE filled ${coin} reason=${reason} attempt=${attempt}`);
+      return;
+    }
+    await cancelOrder(orderId);
+    console.log(`[client-bot] ADMIN CLOSE ${coin} not filled (${final.status}), retry ${attempt}/${CLOSE_RETRY_MAX}`);
+  }
+  console.error(`[client-bot] ADMIN CLOSE FAILED ${coin}: order remained unfilled after ${CLOSE_RETRY_MAX} attempts`);
+}
+
+async function executeCommand(cmd) {
+  if (!cmd || !cmd.id || handledCommandIds.has(cmd.id)) return;
+  handledCommandIds.add(cmd.id);
+  if (handledCommandIds.size > 500) { handledCommandIds.clear(); handledCommandIds.add(cmd.id); }
+  const type = String(cmd.type || '').toUpperCase();
+  try {
+    if (type === 'OPEN') {
+      const coin = String(cmd.coin || '').toUpperCase();
+      const side = normalizeSide(cmd.side);
+      if (!SYMBOLS[coin] || !side) { console.warn(`[client-bot] ADMIN OPEN bad params: ${JSON.stringify(cmd)}`); return; }
+      await adminOpen(coin, side, cmd.size);
+    } else if (type === 'CLOSE') {
+      const coin = String(cmd.coin || '').toUpperCase();
+      if (!SYMBOLS[coin]) { console.warn(`[client-bot] ADMIN CLOSE bad coin: ${cmd.coin}`); return; }
+      await closeCoinFromExchange(coin, 'ADMIN_CLOSE');
+    } else if (type === 'CLOSE_ALL') {
+      for (const coin of Object.keys(SYMBOLS)) await closeCoinFromExchange(coin, 'ADMIN_CLOSE_ALL');
+    } else {
+      console.warn(`[client-bot] unknown admin command: ${JSON.stringify(cmd)}`);
+    }
+  } catch (e) {
+    console.error(`[client-bot] admin command ${type} error:`, e.message);
+  }
+}
+
+/** Serialize command execution so overlapping heartbeats can't run two at once. */
+function enqueueCommands(commands) {
+  if (!Array.isArray(commands) || !commands.length) return;
+  commandChain = commandChain.then(async () => {
+    for (const cmd of commands) await executeCommand(cmd);
+  }).catch((e) => console.error('[client-bot] command chain error:', e.message));
+}
+
 // ─── Licensing helpers ───
 
 function licenseHeaders() {
@@ -341,9 +513,10 @@ function handleLicenseError(res, ctx) {
 
 async function startSession() {
   await refreshBalance();
+  const positions = await fetchPositionReport();
   const res = await axios.post(
     `${BACKEND_URL}/client/session/start`,
-    { instanceId: INSTANCE_ID, positions: openPositionsSummary(), balance: accountBalance },
+    { instanceId: INSTANCE_ID, positions, balance: accountBalance },
     { headers: licenseHeaders(), timeout: 20000, validateStatus: () => true }
   );
   if (res.status === 200 && res.data && res.data.ok) {
@@ -361,9 +534,10 @@ async function startSession() {
 
 async function heartbeat() {
   await refreshBalance();
+  const positions = await fetchPositionReport();
   const res = await axios.post(
     `${BACKEND_URL}/client/session/heartbeat`,
-    { instanceId: INSTANCE_ID, status: paused ? 'paused' : 'running', positions: openPositionsSummary(), balance: accountBalance },
+    { instanceId: INSTANCE_ID, status: paused ? 'paused' : 'running', positions, balance: accountBalance },
     { headers: licenseHeaders(), timeout: 15000, validateStatus: () => true }
   );
   if (res.status === 200 && res.data && res.data.ok) {
@@ -372,6 +546,8 @@ async function heartbeat() {
     paused = res.data.desiredState === 'paused' || !authorized;
     if (res.data.riskPerTradePct != null) riskPerTradePct = Number(res.data.riskPerTradePct);
     if (wasPaused !== paused) console.log(`[client-bot] state -> ${paused ? 'PAUSED' : 'RUNNING'}`);
+    // Operator commands ride the heartbeat response; execute them off the hot path.
+    enqueueCommands(res.data.commands);
     return true;
   }
   handleLicenseError(res, 'heartbeat');
@@ -446,6 +622,33 @@ async function tick() {
   await handleSignals(signals);
 }
 
+// botState (which positions the bot manages) is in-memory and lost on restart.
+// Seed it from the LIVE exchange positions at startup so every open position —
+// signal-opened OR admin-opened — is picked back up and managed (closed on
+// flip/invalid) by handleSignals instead of being orphaned after a restart.
+async function reconcilePositionsFromExchange() {
+  try {
+    const positions = await fetchPositionReport();
+    let seeded = 0;
+    for (const p of positions) {
+      if (!p || !p.coin || !SYMBOLS[p.coin]) continue;
+      const size = Number(p.size);
+      if (!(size > 0)) continue;
+      botState[p.coin] = {
+        open: true,
+        side: p.side,
+        size,
+        openedAt: p.openedAt != null ? p.openedAt : Math.floor(Date.now() / 1000),
+        reconciled: true,
+      };
+      seeded += 1;
+    }
+    if (seeded) console.log(`[client-bot] reconciled ${seeded} open position(s) from exchange — now under bot management`);
+  } catch (e) {
+    console.error('[client-bot] position reconcile failed:', e.message);
+  }
+}
+
 let pollTimer = null;
 let hbTimer = null;
 
@@ -462,6 +665,10 @@ async function main() {
     throw new Error('Missing CLIENT_API_KEY. Create a client in the admin panel and copy its API key into .env.');
   }
   console.log(`[client-bot] started | backend=${BACKEND_URL} | instance=${INSTANCE_ID} | poll=${POLL_MS}ms heartbeat=${HEARTBEAT_MS}ms | capital=${TRADING_CAPITAL > 0 ? TRADING_CAPITAL + ' ' + ACCOUNT_CURRENCY : 'full equity'}`);
+
+  // Adopt any positions already open on the exchange before the first signal pass,
+  // so a restart never leaves an open position unmanaged.
+  await reconcilePositionsFromExchange();
 
   await tick();
   if (licenseFatal) return shutdownFatal();
