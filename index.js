@@ -66,7 +66,10 @@ const SYMBOLS = {
 const SYMBOL_TO_COIN = Object.fromEntries(Object.entries(SYMBOLS).map(([coin, sym]) => [sym, coin]));
 
 const botState = {};
-const lastProcessedSignal = {};
+// Last signal barTime we ATTEMPTED an entry on, per coin. Bounds entries to one
+// attempt per signal bar so a failed/rejected open doesn't re-fire every poll.
+// Exits are NOT gated by this — they follow `desired` on every tick.
+const lastEntryBar = {};
 
 // Licensing runtime state
 let sessionActive = false;   // holds the backend session lock
@@ -313,8 +316,21 @@ async function fetchPositionReport() {
   }
 }
 
-async function openPositionFromSignal(coin, signal) {
-  const side = signal.action === 'LONG' ? 'buy' : 'sell';
+// Read the ACTUAL exchange position for a coin. Returns {open, side, size} or null
+// on a read failure. Used to reconcile botState to reality after an ambiguous
+// order status, so a real fill is never left as an untracked (orphaned) position.
+async function readLivePosition(coin) {
+  const symbol = SYMBOLS[coin];
+  if (!symbol) return null;
+  try {
+    const pos = await kucoinRequest('GET', `/api/v1/position?symbol=${symbol}`);
+    const qty = pos ? Number(pos.currentQty || 0) : 0;
+    if (!qty) return { open: false, side: null, size: 0 };
+    return { open: true, side: qty > 0 ? 'buy' : 'sell', size: Math.abs(qty) };
+  } catch (_) { return null; }
+}
+
+async function openPositionFromSignal(coin, side, signal) {
   const state = botState[coin];
   if (state && state.open) return;
   const { size, basis } = await computeOrderSize(coin);
@@ -326,6 +342,15 @@ async function openPositionFromSignal(coin, signal) {
   const final = await waitForOrderFinal(orderId);
   if (final.status !== 'filled') {
     await cancelOrder(orderId);
+    // A market order can fill even when status polling can't confirm it in time
+    // (KuCoin status-propagation lag → 'timeout'). Adopt whatever is actually on
+    // the exchange so a real fill is never orphaned as an untracked position.
+    const live = await readLivePosition(coin);
+    if (live && live.open) {
+      botState[coin] = { open: true, side: live.side, size: live.size, openedAt: signal.barTime, entryOrderId: orderId };
+      console.log(`[client-bot] OPEN adopted ${coin} ${live.side} size=${live.size} (status was ${final.status}, position live on exchange)`);
+      return;
+    }
     console.log(`[client-bot] OPEN ${coin} ${side} not filled (${final.status})`);
     return;
   }
@@ -337,30 +362,6 @@ async function openPositionFromSignal(coin, signal) {
     entryOrderId: orderId,
   };
   console.log(`[client-bot] OPEN filled ${coin} ${side} size=${size} (${basis})`);
-}
-
-async function closePosition(coin, reason) {
-  const state = botState[coin];
-  if (!state || !state.open) return;
-
-  const closeSide = state.side === 'buy' ? 'sell' : 'buy';
-  for (let attempt = 1; attempt <= CLOSE_RETRY_MAX; attempt += 1) {
-    const orderId = await placeMarketOrder({
-      coin,
-      side: closeSide,
-      size: state.size,
-      reduceOnly: true,
-    });
-    const final = await waitForOrderFinal(orderId);
-    if (final.status === 'filled') {
-      botState[coin] = { open: false, lastCloseReason: reason, closedAt: Date.now() };
-      console.log(`[client-bot] CLOSE filled ${coin} reason=${reason} attempt=${attempt}`);
-      return;
-    }
-    await cancelOrder(orderId);
-    console.log(`[client-bot] CLOSE ${coin} not filled (${final.status}), retry ${attempt}/${CLOSE_RETRY_MAX}`);
-  }
-  console.error(`[client-bot] CLOSE FAILED ${coin}: order remained unfilled after ${CLOSE_RETRY_MAX} attempts`);
 }
 
 // ─── Admin remote control ───
@@ -404,9 +405,12 @@ async function adminOpen(coin, side, sizeOverride) {
 }
 
 /**
- * Operator-forced close. Reads the LIVE exchange position (not just botState) so it
- * closes whatever is actually open — even a position this bot didn't open or has
- * forgotten after a restart. reduceOnly market close, retried like a normal close.
+ * Close a coin by reading the LIVE exchange position (not botState.size) so it
+ * closes whatever is ACTUALLY open — the real filled size, even a position this
+ * bot didn't open or has forgotten after a restart, and even if botState's size
+ * drifted from reality. reduceOnly market close, retried on non-fill. This is the
+ * single close path for both signal-driven exits and operator commands; `reason`
+ * distinguishes them (SIGNAL_FLAT / FLIP_DIRECTION / ADMIN_CLOSE / ADMIN_CLOSE_ALL).
  */
 async function closeCoinFromExchange(coin, reason) {
   const symbol = SYMBOLS[coin];
@@ -415,7 +419,10 @@ async function closeCoinFromExchange(coin, reason) {
   try { pos = await kucoinRequest('GET', `/api/v1/position?symbol=${symbol}`); } catch (_) {}
   const qty = pos ? Number(pos.currentQty || 0) : 0;
   if (!qty) {
-    console.log(`[client-bot] ADMIN CLOSE ${coin} — no open position`);
+    // Bot believed it held a position but the exchange is flat — a benign desync
+    // that we self-heal by clearing botState. (Normal for a position already
+    // closed by the exchange, or an admin close on an already-flat coin.)
+    console.log(`[client-bot] CLOSE ${coin} reason=${reason} — no open position on exchange (state cleared)`);
     botState[coin] = { open: false, lastCloseReason: reason, closedAt: Date.now() };
     return;
   }
@@ -426,13 +433,13 @@ async function closeCoinFromExchange(coin, reason) {
     const final = await waitForOrderFinal(orderId);
     if (final.status === 'filled') {
       botState[coin] = { open: false, lastCloseReason: reason, closedAt: Date.now() };
-      console.log(`[client-bot] ADMIN CLOSE filled ${coin} reason=${reason} attempt=${attempt}`);
+      console.log(`[client-bot] CLOSE filled ${coin} reason=${reason} attempt=${attempt}`);
       return;
     }
     await cancelOrder(orderId);
-    console.log(`[client-bot] ADMIN CLOSE ${coin} not filled (${final.status}), retry ${attempt}/${CLOSE_RETRY_MAX}`);
+    console.log(`[client-bot] CLOSE ${coin} not filled (${final.status}), retry ${attempt}/${CLOSE_RETRY_MAX}`);
   }
-  console.error(`[client-bot] ADMIN CLOSE FAILED ${coin}: order remained unfilled after ${CLOSE_RETRY_MAX} attempts`);
+  console.error(`[client-bot] CLOSE FAILED ${coin}: order remained unfilled after ${CLOSE_RETRY_MAX} attempts`);
 }
 
 async function executeCommand(cmd) {
@@ -575,36 +582,58 @@ async function fetchSignals() {
   return {};
 }
 
-async function handleSignals(signals) {
-  const coins = Object.keys(SYMBOLS);
+// Backend `desired` (long|short|flat) → order side (buy|sell) or null for flat.
+function desiredSide(desired) {
+  const v = String(desired || 'flat').toLowerCase();
+  if (v === 'long' || v === 'buy') return 'buy';
+  if (v === 'short' || v === 'sell') return 'sell';
+  return null; // flat / unknown
+}
 
-  for (const coin of coins) {
+/**
+ * Reconcile each coin's REAL position to the backend's `desired` state — the same
+ * virtual position the dashboard shows. This is the fix for the old churn: the bot
+ * no longer closes on every SKIP bar. Instead:
+ *   • desired flat  + open  → close (this is how SL/TP/trailing/trend-flip and the
+ *                                     operator's manual CLOSE reach the bot).
+ *   • desired dir   + flat  → open, but ONLY on an actual entry signal for this bar
+ *                             (actionable action + matching direction) so entries
+ *                             still fire at the strategy's price, never a late catch-up.
+ *   • desired dir   + open opposite → flip (close, then open if actionable).
+ *   • desired matches current side → HOLD.
+ * Exits act every tick; entries are bounded to one attempt per signal bar.
+ */
+async function handleSignals(signals) {
+  for (const coin of Object.keys(SYMBOLS)) {
     const sig = signals[coin];
     if (!sig) continue;
+
     const action = sig.action || 'SKIP';
-    const key = `${action}:${sig.barTime || 0}`;
-    if (lastProcessedSignal[coin] === key) continue;
-    lastProcessedSignal[coin] = key;
-
-    const state = botState[coin] || { open: false };
+    const want = desiredSide(sig.desired);                 // 'buy' | 'sell' | null(flat)
     const actionable = (action === 'LONG' || action === 'SHORT') && !!sig.confOk;
+    const entrySide = action === 'LONG' ? 'buy' : action === 'SHORT' ? 'sell' : null;
+    const barKey = `${sig.barTime || 0}`;
+    const state = botState[coin] || { open: false };
 
-    // Paused / unauthorized: do not open NEW positions. Existing positions are
-    // still managed (closed on flip/invalid) so risk isn't left unmanaged.
-    if (!state.open && actionable) {
-      if (paused || !authorized) continue;
-      await openPositionFromSignal(coin, sig);
-      continue;
-    }
-
+    // ── Manage an OPEN position (runs every tick, not gated by barTime) ──
     if (state.open) {
-      const sameDirection =
-        (state.side === 'buy' && action === 'LONG') ||
-        (state.side === 'sell' && action === 'SHORT');
-      if (!actionable || !sameDirection) {
-        await closePosition(coin, !actionable ? 'SIGNAL_INVALID' : 'FLIP_DIRECTION');
+      if (!want) {                                         // desired flat → close
+        await closeCoinFromExchange(coin, 'SIGNAL_FLAT');
+        continue;
       }
+      if (want === state.side) continue;                  // desired matches → hold
+      // Desired flipped to the opposite side → close now; the entry below re-opens.
+      await closeCoinFromExchange(coin, 'FLIP_DIRECTION');
     }
+
+    // ── Open / flip-open (only on a real entry signal for THIS bar) ──
+    const now = botState[coin] || { open: false };
+    if (now.open) continue;                               // still open (close didn't fill) — retry next tick
+    if (!want || !actionable || entrySide !== want) continue; // no entry to make right now
+    if (paused || !authorized) continue;                  // paused: manage exits only, no new entries
+    if (lastEntryBar[coin] === barKey) continue;          // already attempted an entry this bar
+    lastEntryBar[coin] = barKey;
+    await openPositionFromSignal(coin, entrySide, sig);
   }
 }
 
