@@ -31,6 +31,7 @@ const BUILD = path.join(ROOT, 'build');
 const DIST = path.join(ROOT, 'dist');
 const BUNDLE = path.join(BUILD, 'bundle.js');
 const OBF = path.join(BUILD, 'bot.obf.js');
+const BUILTINS = require('module').builtinModules.filter((m) => !m.startsWith('_'));
 
 fs.mkdirSync(BUILD, { recursive: true });
 fs.mkdirSync(DIST, { recursive: true });
@@ -67,6 +68,12 @@ function obfuscate() {
     stringArray: true,
     stringArrayEncoding: ['base64'],
     stringArrayThreshold: 0.85,
+    // Keep Node built-in module names as plain literals. After esbuild bundling the
+    // only require() calls left are built-ins; if their arguments get moved into the
+    // string array, pkg can't resolve them statically and emits "Dynamic require may
+    // fail" warnings on every build. Harmless at runtime, but noisy — and exempting
+    // strings like "fs"/"http" costs nothing in protection.
+    reservedStrings: [`^(?:node:)?(?:${BUILTINS.join('|')})$`],
     // selfDefending/debugProtection are intentionally OFF: their anti-tamper loops
     // are incompatible with pkg's V8 snapshot and hang the packaged .exe. Control-flow
     // flattening + string-array encoding + name mangling already make the source

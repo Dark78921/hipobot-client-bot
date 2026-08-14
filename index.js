@@ -49,6 +49,105 @@ function loadInstanceId() {
 }
 const INSTANCE_ID = loadInstanceId();
 
+// ─── Trading-history reporting ───
+// Every order the bot submits and every position that closes is reported to the
+// backend, which stores it per client so the history survives bot restarts and is
+// readable from the My Bot page / Admin Panel. Delivery is an outbox: events are
+// queued (and mirrored to disk) and retried until the backend acknowledges them,
+// so a backend outage or a bot crash doesn't lose executed trades.
+const HISTORY_FILE = path.join(__dirname, '.history-outbox.json');
+const HISTORY_BATCH = parseInt(process.env.CLIENT_HISTORY_BATCH, 10) || 50;
+const HISTORY_MAX_QUEUE = parseInt(process.env.CLIENT_HISTORY_MAX_QUEUE, 10) || 300;
+
+/** Finite number or null. KuCoin returns numbers as strings and omits fields entirely. */
+function num(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function loadHistoryQueue() {
+  try {
+    const list = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+    return Array.isArray(list) ? list.slice(-HISTORY_MAX_QUEUE) : [];
+  } catch (_) {
+    return []; // first run, or an unreadable/corrupt outbox
+  }
+}
+
+// Pending events, oldest first. Loaded from disk at startup so events queued by a
+// previous run (or a crash mid-delivery) still reach the backend.
+let historyQueue = loadHistoryQueue();
+let historyFlushing = false;
+
+function persistHistoryQueue() {
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(historyQueue));
+  } catch (_) { /* read-only fs (packaged exe): the queue still works in memory */ }
+}
+
+/** Stable per-event id. Generated once at record time so retries stay idempotent. */
+function newEventId() {
+  return 'evt_' + Date.now().toString(36) + crypto.randomBytes(6).toString('hex');
+}
+
+/**
+ * Queue one executed event for delivery. The backend upserts on `eventId`, so a
+ * re-sent batch is a no-op there and we can retry freely. When the queue overflows
+ * (a long backend outage) the OLDEST events are dropped — the newest trades are
+ * the ones most likely to still be missing from the server.
+ */
+function recordEvent(kind, event) {
+  historyQueue.push({
+    kind,
+    event: { ...event, eventId: newEventId(), clientTime: Date.now(), instanceId: INSTANCE_ID },
+  });
+  if (historyQueue.length > HISTORY_MAX_QUEUE) {
+    const dropped = historyQueue.length - HISTORY_MAX_QUEUE;
+    historyQueue = historyQueue.slice(dropped);
+    console.warn(`[client-bot] history outbox full — dropped ${dropped} oldest event(s)`);
+  }
+  persistHistoryQueue();
+}
+
+const recordOrder = (event) => recordEvent('order', event);
+const recordPosition = (event) => recordEvent('position', event);
+
+/**
+ * Ship the oldest queued events. Rows leave the queue only once the backend has
+ * acknowledged them, so a failed POST simply retries on the next flush.
+ *
+ * Reporting failures never touch the licensing flags: history is a side channel,
+ * and a backend hiccup here must not stop a bot that is managing live positions.
+ */
+async function flushHistory() {
+  if (historyFlushing || !historyQueue.length || !CLIENT_API_KEY) return;
+  historyFlushing = true;
+  try {
+    const batch = historyQueue.slice(0, HISTORY_BATCH);
+    const res = await axios.post(
+      `${BACKEND_URL}/client/history`,
+      {
+        instanceId: INSTANCE_ID,
+        orders: batch.filter((e) => e.kind === 'order').map((e) => e.event),
+        positions: batch.filter((e) => e.kind === 'position').map((e) => e.event),
+      },
+      { headers: licenseHeaders(), timeout: 20000, validateStatus: () => true }
+    );
+    if (res.status === 200 && res.data && res.data.ok) {
+      historyQueue = historyQueue.slice(batch.length);
+      persistHistoryQueue();
+    } else {
+      const msg = (res.data && res.data.error) || `HTTP ${res.status}`;
+      console.warn(`[client-bot] history report failed (${msg}) — ${historyQueue.length} event(s) queued for retry`);
+    }
+  } catch (e) {
+    console.error('[client-bot] history flush failed:', e.message);
+  } finally {
+    historyFlushing = false;
+  }
+}
+
 const KUCOIN_BASE = process.env.KUCOIN_BASE_URL || 'https://api-futures.kucoin.com';
 const API_KEY = process.env.KUCOIN_API_KEY || '';
 const API_SECRET = process.env.KUCOIN_API_SECRET || '';
@@ -330,6 +429,156 @@ async function readLivePosition(coin) {
   } catch (_) { return null; }
 }
 
+// ─── Executed-history events ───
+// Everything the bot actually does on the exchange is turned into an event here
+// and queued for the backend. Timestamps on position events are epoch MILLIseconds
+// (KuCoin's `openingTimestamp` unit), while botState.openedAt stays in seconds to
+// match the live position report — conversions happen in positionSnapshot.
+
+/**
+ * What a submitted order actually filled. KuCoin reports `dealValue` as executed
+ * notional in quote currency and `dealSize` in contracts, so the average fill
+ * price is dealValue / (dealSize × contract multiplier). Any missing piece yields
+ * null rather than a bogus number.
+ */
+async function fillInfo(coin, raw) {
+  let mult = 0;
+  try { mult = await getMultiplier(SYMBOLS[coin]); } catch (_) { /* amount/price stay null */ }
+  const filledSize = num(raw && (raw.dealSize != null ? raw.dealSize : raw.filledSize));
+  const value = num(raw && (raw.dealValue != null ? raw.dealValue : raw.filledValue));
+  const amount = filledSize != null && mult > 0 ? filledSize * mult : null;
+  return {
+    filledSize,
+    value,
+    amount,
+    price: value != null && amount ? value / amount : null,
+    fee: num(raw && raw.fee),
+  };
+}
+
+/** One submitted-order event, shaped to the backend's bot_orders schema. */
+function orderEvent({ coin, side, size, intent, reason, status, reduceOnly, basis, orderId, barTime, error, fill }) {
+  return {
+    coin,
+    symbol: SYMBOLS[coin] || null,
+    side,
+    intent,
+    reason,
+    status,
+    size,
+    filledSize: fill ? fill.filledSize : null,
+    amount: fill ? fill.amount : null,
+    price: fill ? fill.price : null,
+    value: fill ? fill.value : null,
+    fee: fill ? fill.fee : null,
+    // Closing orders are reduceOnly and carry no leverage (KuCoin rejects it).
+    leverage: reduceOnly ? null : KUCOIN_LEVERAGE,
+    reduceOnly: !!reduceOnly,
+    sizingBasis: basis || null,
+    orderId: orderId || null,
+    barTime: barTime != null ? barTime : null,
+    error: error || null,
+  };
+}
+
+/**
+ * Entry-side facts read from the LIVE exchange position, captured before a close
+ * is submitted — once it fills the exchange reports the coin flat and the entry
+ * price, open time and leverage are no longer readable. Falls back to what the
+ * bot recorded at entry when the exchange read failed.
+ */
+function positionSnapshot(coin, pos, qty) {
+  const st = botState[coin] || {};
+  const openedAtSec = num(st.openedAt);
+  return {
+    side: qty > 0 ? 'buy' : 'sell',
+    size: Math.abs(qty),
+    entryPrice: num(pos && pos.avgEntryPrice) != null ? num(pos.avgEntryPrice) : num(st.entryPrice),
+    leverage: num(pos && pos.realLeverage),
+    realisedPnl: num(pos && pos.realisedPnl),
+    openedAt: num(pos && pos.openingTimestamp) != null
+      ? num(pos.openingTimestamp)
+      : (openedAtSec != null ? openedAtSec * 1000 : null),
+    entryOrderId: st.entryOrderId || null,
+  };
+}
+
+/**
+ * One completed round trip. PnL is computed from the entry price the exchange
+ * reported before the close and the average fill price of the closing order over
+ * the base-asset amount, so it lines up with what KuCoin shows for the trade.
+ * `realisedPnl` carries the exchange's own figure alongside it.
+ */
+function closedPositionEvent({ coin, entry, reason, exitFill, exitOrderId }) {
+  const closedAt = Date.now();
+  const amount = exitFill.amount;
+  const exitPrice = exitFill.price;
+  const dir = entry.side === 'buy' ? 1 : -1;
+  const pnl = entry.entryPrice != null && exitPrice != null && amount != null
+    ? (exitPrice - entry.entryPrice) * amount * dir
+    : null;
+  const notional = entry.entryPrice != null && amount != null ? entry.entryPrice * amount : null;
+  return {
+    coin,
+    symbol: SYMBOLS[coin] || null,
+    side: entry.side,
+    reason,
+    size: entry.size,
+    amount,
+    entryPrice: entry.entryPrice,
+    exitPrice,
+    pnl,
+    pnlPct: pnl != null && notional ? (pnl / notional) * 100 : null,
+    fee: exitFill.fee,
+    realisedPnl: entry.realisedPnl,
+    leverage: entry.leverage,
+    openedAt: entry.openedAt,
+    closedAt,
+    durationMs: entry.openedAt != null ? closedAt - entry.openedAt : null,
+    entryOrderId: entry.entryOrderId,
+    exitOrderId,
+  };
+}
+
+/**
+ * Place an opening market order, report what happened, and adopt the resulting
+ * position into botState. Shared by signal entries and operator OPEN commands so
+ * both report identically; `reason` distinguishes them. `openedAt` is in seconds
+ * (matching the live position report) and seeds the round-trip duration on close.
+ */
+async function submitOpen({ coin, side, size, basis, reason, barTime, openedAt }) {
+  let orderId;
+  try {
+    orderId = await placeMarketOrder({ coin, side, size, reduceOnly: false });
+  } catch (e) {
+    recordOrder(orderEvent({ coin, side, size, intent: 'OPEN', reason, status: 'error', basis, barTime, error: e.message }));
+    throw e;
+  }
+  const final = await waitForOrderFinal(orderId);
+  const fill = await fillInfo(coin, final.raw);
+
+  if (final.status !== 'filled') {
+    await cancelOrder(orderId);
+    // A market order can fill even when status polling can't confirm it in time
+    // (KuCoin status-propagation lag → 'timeout'). Adopt whatever is actually on
+    // the exchange so a real fill is never orphaned as an untracked position.
+    const live = await readLivePosition(coin);
+    if (live && live.open) {
+      recordOrder(orderEvent({ coin, side, size, intent: 'OPEN', reason, status: 'adopted', basis, orderId, barTime, fill }));
+      botState[coin] = { open: true, side: live.side, size: live.size, openedAt, entryOrderId: orderId, entryPrice: fill.price };
+      console.log(`[client-bot] OPEN adopted ${coin} ${live.side} size=${live.size} reason=${reason} (status was ${final.status}, position live on exchange)`);
+      return;
+    }
+    recordOrder(orderEvent({ coin, side, size, intent: 'OPEN', reason, status: final.status, basis, orderId, barTime, fill }));
+    console.log(`[client-bot] OPEN ${coin} ${side} reason=${reason} not filled (${final.status})`);
+    return;
+  }
+
+  recordOrder(orderEvent({ coin, side, size, intent: 'OPEN', reason, status: 'filled', basis, orderId, barTime, fill }));
+  botState[coin] = { open: true, side, size, openedAt, entryOrderId: orderId, entryPrice: fill.price };
+  console.log(`[client-bot] OPEN filled ${coin} ${side} size=${size} reason=${reason} (${basis})`);
+}
+
 async function openPositionFromSignal(coin, side, signal) {
   const state = botState[coin];
   if (state && state.open) return;
@@ -338,30 +587,7 @@ async function openPositionFromSignal(coin, side, signal) {
     console.log(`[client-bot] OPEN ${coin} skipped — ${basis} (risk=${riskPerTradePct}% equity=${accountBalance && accountBalance.equity})`);
     return;
   }
-  const orderId = await placeMarketOrder({ coin, side, size, reduceOnly: false });
-  const final = await waitForOrderFinal(orderId);
-  if (final.status !== 'filled') {
-    await cancelOrder(orderId);
-    // A market order can fill even when status polling can't confirm it in time
-    // (KuCoin status-propagation lag → 'timeout'). Adopt whatever is actually on
-    // the exchange so a real fill is never orphaned as an untracked position.
-    const live = await readLivePosition(coin);
-    if (live && live.open) {
-      botState[coin] = { open: true, side: live.side, size: live.size, openedAt: signal.barTime, entryOrderId: orderId };
-      console.log(`[client-bot] OPEN adopted ${coin} ${live.side} size=${live.size} (status was ${final.status}, position live on exchange)`);
-      return;
-    }
-    console.log(`[client-bot] OPEN ${coin} ${side} not filled (${final.status})`);
-    return;
-  }
-  botState[coin] = {
-    open: true,
-    side,
-    size,
-    openedAt: signal.barTime,
-    entryOrderId: orderId,
-  };
-  console.log(`[client-bot] OPEN filled ${coin} ${side} size=${size} (${basis})`);
+  await submitOpen({ coin, side, size, basis, reason: 'SIGNAL_ENTRY', barTime: signal.barTime, openedAt: signal.barTime });
 }
 
 // ─── Admin remote control ───
@@ -393,15 +619,7 @@ async function adminOpen(coin, side, sizeOverride) {
     ({ size, basis } = await computeOrderSize(coin));
   }
   if (size < 1) { console.log(`[client-bot] ADMIN OPEN ${coin} skipped — ${basis}`); return; }
-  const orderId = await placeMarketOrder({ coin, side, size, reduceOnly: false });
-  const final = await waitForOrderFinal(orderId);
-  if (final.status !== 'filled') {
-    await cancelOrder(orderId);
-    console.log(`[client-bot] ADMIN OPEN ${coin} ${side} not filled (${final.status})`);
-    return;
-  }
-  botState[coin] = { open: true, side, size, openedAt: Math.floor(Date.now() / 1000), entryOrderId: orderId };
-  console.log(`[client-bot] ADMIN OPEN filled ${coin} ${side} size=${size} (${basis})`);
+  await submitOpen({ coin, side, size, basis, reason: 'ADMIN_OPEN', openedAt: Math.floor(Date.now() / 1000) });
 }
 
 /**
@@ -428,10 +646,24 @@ async function closeCoinFromExchange(coin, reason) {
   }
   const closeSide = qty > 0 ? 'sell' : 'buy';
   const size = Math.abs(qty);
+  // Snapshot the entry side now: after the close fills the exchange reports this
+  // coin flat, and the round-trip record would lose its entry price and open time.
+  const entry = positionSnapshot(coin, pos, qty);
+
   for (let attempt = 1; attempt <= CLOSE_RETRY_MAX; attempt += 1) {
-    const orderId = await placeMarketOrder({ coin, side: closeSide, size, reduceOnly: true });
+    let orderId;
+    try {
+      orderId = await placeMarketOrder({ coin, side: closeSide, size, reduceOnly: true });
+    } catch (e) {
+      recordOrder(orderEvent({ coin, side: closeSide, size, intent: 'CLOSE', reason, status: 'error', reduceOnly: true, error: e.message }));
+      throw e;
+    }
     const final = await waitForOrderFinal(orderId);
+    const fill = await fillInfo(coin, final.raw);
+    recordOrder(orderEvent({ coin, side: closeSide, size, intent: 'CLOSE', reason, status: final.status, reduceOnly: true, orderId, fill }));
+
     if (final.status === 'filled') {
+      recordPosition(closedPositionEvent({ coin, entry, reason, exitFill: fill, exitOrderId: orderId }));
       botState[coin] = { open: false, lastCloseReason: reason, closedAt: Date.now() };
       console.log(`[client-bot] CLOSE filled ${coin} reason=${reason} attempt=${attempt}`);
       return;
@@ -668,6 +900,7 @@ async function reconcilePositionsFromExchange() {
         side: p.side,
         size,
         openedAt: p.openedAt != null ? p.openedAt : Math.floor(Date.now() / 1000),
+        entryPrice: p.entryPrice != null ? p.entryPrice : null,
         reconciled: true,
       };
       seeded += 1;
@@ -699,6 +932,9 @@ async function main() {
   // so a restart never leaves an open position unmanaged.
   await reconcilePositionsFromExchange();
 
+  // Deliver anything the previous run left in the outbox before trading again.
+  await flushHistory();
+
   await tick();
   if (licenseFatal) return shutdownFatal();
 
@@ -709,13 +945,23 @@ async function main() {
 
   hbTimer = setInterval(async () => {
     if (licenseFatal) return shutdownFatal();
-    if (!sessionActive) { await ensureSession().catch((e) => console.error('[client-bot] session error:', e.message)); return; }
-    await heartbeat().catch((err) => console.error('[client-bot] heartbeat error:', err.message));
+    if (!sessionActive) {
+      await ensureSession().catch((e) => console.error('[client-bot] session error:', e.message));
+    } else {
+      await heartbeat().catch((err) => console.error('[client-bot] heartbeat error:', err.message));
+    }
+    // Executed orders/positions ship on the heartbeat cadence. This runs even
+    // while the session is unclaimed, so history from a bot that lost its lock
+    // (or is awaiting approval) still reaches the backend.
+    await flushHistory();
   }, HEARTBEAT_MS);
 }
 
 async function gracefulExit() {
   console.log('[client-bot] shutting down — releasing session lock...');
+  // Last chance to deliver executed trades; anything left stays on disk for the
+  // next start.
+  await flushHistory();
   await stopSession();
   process.exit(0);
 }

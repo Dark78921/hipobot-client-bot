@@ -18,6 +18,7 @@ The feed is deliberately strategy-free: each coin arrives as only `{ action, con
 - Closes with `reduceOnly` market orders
 - Checks close order status (`filled` / `unfilled` / `partial` / `timeout`)
 - Retries close if order is not filled
+- **Trading-history reporting:** every order the bot submits and every position that closes is reported to the backend and stored per client, so the record survives bot restarts and is readable from the My Bot page and the Admin Panel. Delivery is an on-disk outbox (`.history-outbox.json`): events are queued and retried until the backend acknowledges them, so a backend outage or a bot crash doesn't lose executed trades. Each event carries a unique id and the backend upserts on it, so a retried batch never duplicates rows.
 
 ## Setup
 
@@ -42,6 +43,11 @@ Set your **licensing key** and KuCoin credentials in `.env`:
 Optional — **allocate your own capital**:
 
 - `TRADING_CAPITAL` — the amount of your wallet (in `KUCOIN_ACCOUNT_CURRENCY`) you want the bot to trade with. When set (>0), the provider's risk % is applied to this amount instead of your full account equity, so you can run the bot on only part of your balance. It's capped at your real equity, so it can never over-allocate. Leave `0`/blank to size off the full account.
+
+Optional — **history reporting** (defaults are fine for normal use):
+
+- `CLIENT_HISTORY_BATCH` — max events sent per report (default `50`)
+- `CLIENT_HISTORY_MAX_QUEUE` — max events held in the outbox during a backend outage (default `300`). Past this, the **oldest** events are dropped so the newest trades still get through.
 
 ## Build a protected distribution (no readable source)
 
@@ -82,5 +88,6 @@ On start the bot claims a session, then heartbeats every `CLIENT_HEARTBEAT_MS`. 
 - Default backend URL: `https://provider.hipobot.xyz` (override with `SIGNAL_BACKEND_URL`; use `http://127.0.0.1:3400` for local dev)
 - Default KuCoin base URL: `https://api-futures.kucoin.com`
 - A stable instance id is stored in `.instance-id` so restarts re-claim the same session instead of tripping the double-bot guard against the bot's own prior session. Delete it (or set `CLIENT_INSTANCE_ID`) to force a fresh identity.
+- Undelivered history events are kept in `.history-outbox.json` next to the bot and flushed on the heartbeat cadence, at startup, and on shutdown. Both files are git-ignored; on a read-only filesystem the bot keeps them in memory instead.
 - `paused` (set from the admin/My Bot UI) stops **new** entries; open positions are still closed on signal-invalid / direction-flip.
 - Close behavior follows signal invalid / direction flip triggers, then verifies order fill state.

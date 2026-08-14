@@ -1,6 +1,6 @@
 {
   "name": "signal-client-bot",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Standalone KuCoin client bot consuming signal-backend",
   "main": "index.js",
